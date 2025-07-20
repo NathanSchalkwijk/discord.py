@@ -858,7 +858,6 @@ class DiscordVoiceWebSocket:
                 'token': state.token,
                 'server_id': str(state.server_id),
                 'session_id': state.session_id,
-                'seq_ack': self.seq_ack,
             },
         }
         await self.send_as_json(payload)
@@ -883,7 +882,6 @@ class DiscordVoiceWebSocket:
         *,
         resume: bool = False,
         hook: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None,
-        seq_ack: int = -1,
     ) -> Self:
         """Creates a voice websocket for the :class:`VoiceClient`."""
         gateway = f'wss://{state.endpoint}/?v=8'
@@ -892,7 +890,6 @@ class DiscordVoiceWebSocket:
         socket = await http.ws_connect(gateway, compress=15)
         ws = cls(socket, loop=client.loop, hook=hook)
         ws.gateway = gateway
-        ws.seq_ack = seq_ack
         ws._connection = state
         ws._max_heartbeat_timeout = 60.0
         ws.thread_id = threading.get_ident()
@@ -937,6 +934,7 @@ class DiscordVoiceWebSocket:
                 'delay': 0,
                 'ssrc': self._connection.ssrc,
             },
+            'seq': self.seq_ack,
         }
 
         await self.send_as_json(payload)
@@ -945,7 +943,7 @@ class DiscordVoiceWebSocket:
         _log.debug('Voice websocket frame received: %s', msg)
         op = msg['op']
         data = msg['d']  # According to Discord this key is always given
-        self.seq_ack = msg.get('seq', self.seq_ack)  # this key could not be given
+        self.seq_ack = msg.get('seq', self.seq_ack)  # this key may not be given
 
         if op == self.READY:
             await self.initial_connection(data)
