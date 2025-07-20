@@ -20,699 +20,1037 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
-
-
-Some documentation to refer to:
-
-- Our main web socket (mWS) sends opcode 4 with a guild ID and channel ID.
-- The mWS receives VOICE_STATE_UPDATE and VOICE_SERVER_UPDATE.
-- We pull the session_id from VOICE_STATE_UPDATE.
-- We pull the token, endpoint and server_id from VOICE_SERVER_UPDATE.
-- Then we initiate the voice web socket (vWS) pointing to the endpoint.
-- We send opcode 0 with the user_id, server_id, session_id and token using the vWS.
-- The vWS sends back opcode 2 with an ssrc, port, modes(array) and heartbeat_interval.
-- We send a UDP discovery packet to endpoint:port and receive our IP and our port in LE.
-- Then we send our IP and port via vWS with opcode 1.
-- When that's all done, we receive opcode 4 from the vWS.
-- Finally we can transmit data to endpoint:port.
 """
 
 from __future__ import annotations
 
-import select
-import socket
 import asyncio
+from collections import deque
+import concurrent.futures
 import logging
+import struct
+import sys
+import time
 import threading
+import traceback
 
-from typing import TYPE_CHECKING, Optional, Dict, List, Callable, Coroutine, Any, Tuple
+from typing import Any, Callable, Coroutine, Deque, Dict, List, TYPE_CHECKING, NamedTuple, Optional, TypeVar, Tuple
 
-from .enums import Enum
-from .utils import MISSING, sane_wait_for
+import aiohttp
+import yarl
+
+from . import utils
+from .activity import BaseActivity
+from .enums import SpeakingState
 from .errors import ConnectionClosed
-from .backoff import ExponentialBackoff
-from .gateway import DiscordVoiceWebSocket
-
-if TYPE_CHECKING:
-    from . import abc
-    from .guild import Guild
-    from .user import ClientUser
-    from .member import VoiceState
-    from .voice_client import VoiceClient
-
-    from .types.voice import (
-        GuildVoiceState as GuildVoiceStatePayload,
-        VoiceServerUpdate as VoiceServerUpdatePayload,
-        SupportedModes,
-    )
-
-    WebsocketHook = Optional[Callable[[DiscordVoiceWebSocket, Dict[str, Any]], Coroutine[Any, Any, Any]]]
-    SocketReaderCallback = Callable[[bytes], Any]
-
-
-__all__ = ('VoiceConnectionState',)
 
 _log = logging.getLogger(__name__)
 
+__all__ = (
+    'DiscordWebSocket',
+    'KeepAliveHandler',
+    'VoiceKeepAliveHandler',
+    'DiscordVoiceWebSocket',
+    'ReconnectWebSocket',
+)
 
-class SocketReader(threading.Thread):
-    def __init__(self, state: VoiceConnectionState, *, start_paused: bool = True) -> None:
-        super().__init__(daemon=True, name=f'voice-socket-reader:{id(self):#x}')
-        self.state: VoiceConnectionState = state
-        self.start_paused = start_paused
-        self._callbacks: List[SocketReaderCallback] = []
-        self._running = threading.Event()
-        self._end = threading.Event()
-        # If we have paused reading due to having no callbacks
-        self._idle_paused: bool = True
+if TYPE_CHECKING:
+    from typing_extensions import Self
 
-    def register(self, callback: SocketReaderCallback) -> None:
-        self._callbacks.append(callback)
-        if self._idle_paused:
-            self._idle_paused = False
-            self._running.set()
+    from .client import Client
+    from .state import ConnectionState
+    from .voice_state import VoiceConnectionState
 
-    def unregister(self, callback: SocketReaderCallback) -> None:
-        try:
-            self._callbacks.remove(callback)
-        except ValueError:
-            pass
-        else:
-            if not self._callbacks and self._running.is_set():
-                # If running is not set, we are either explicitly paused and
-                # should be explicitly resumed, or we are already idle paused
-                self._idle_paused = True
-                self._running.clear()
 
-    def pause(self) -> None:
-        self._idle_paused = False
-        self._running.clear()
+class ReconnectWebSocket(Exception):
+    """Signals to safely reconnect the websocket."""
 
-    def resume(self, *, force: bool = False) -> None:
-        if self._running.is_set():
-            return
-        # Don't resume if there are no callbacks registered
-        if not force and not self._callbacks:
-            # We tried to resume but there was nothing to do, so resume when ready
-            self._idle_paused = True
-            return
-        self._idle_paused = False
-        self._running.set()
+    def __init__(self, shard_id: Optional[int], *, resume: bool = True) -> None:
+        self.shard_id: Optional[int] = shard_id
+        self.resume: bool = resume
+        self.op: str = 'RESUME' if resume else 'IDENTIFY'
 
-    def stop(self) -> None:
-        self._end.set()
-        self._running.set()
+
+class WebSocketClosure(Exception):
+    """An exception to make up for the fact that aiohttp doesn't signal closure."""
+
+    pass
+
+
+class EventListener(NamedTuple):
+    predicate: Callable[[Dict[str, Any]], bool]
+    event: str
+    result: Optional[Callable[[Dict[str, Any]], Any]]
+    future: asyncio.Future[Any]
+
+
+class GatewayRatelimiter:
+    def __init__(self, count: int = 110, per: float = 60.0) -> None:
+        # The default is 110 to give room for at least 10 heartbeats per minute
+        self.max: int = count
+        self.remaining: int = count
+        self.window: float = 0.0
+        self.per: float = per
+        self.lock: asyncio.Lock = asyncio.Lock()
+        self.shard_id: Optional[int] = None
+
+    def is_ratelimited(self) -> bool:
+        current = time.time()
+        if current > self.window + self.per:
+            return False
+        return self.remaining == 0
+
+    def get_delay(self) -> float:
+        current = time.time()
+
+        if current > self.window + self.per:
+            self.remaining = self.max
+
+        if self.remaining == self.max:
+            self.window = current
+
+        if self.remaining == 0:
+            return self.per - (current - self.window)
+
+        self.remaining -= 1
+        return 0.0
+
+    async def block(self) -> None:
+        async with self.lock:
+            delta = self.get_delay()
+            if delta:
+                _log.warning('WebSocket in shard ID %s is ratelimited, waiting %.2f seconds', self.shard_id, delta)
+                await asyncio.sleep(delta)
+
+
+class KeepAliveHandler(threading.Thread):
+    def __init__(
+        self,
+        *args: Any,
+        ws: DiscordWebSocket,
+        interval: Optional[float] = None,
+        shard_id: Optional[int] = None,
+        **kwargs: Any,
+    ) -> None:
+        daemon: bool = kwargs.pop('daemon', True)
+        name: str = kwargs.pop('name', f'keep-alive-handler:shard-{shard_id}')
+        super().__init__(*args, daemon=daemon, name=name, **kwargs)
+        self.ws: DiscordWebSocket = ws
+        self._main_thread_id: int = ws.thread_id
+        self.interval: Optional[float] = interval
+        self.shard_id: Optional[int] = shard_id
+        self.msg: str = 'Keeping shard ID %s websocket alive with sequence %s.'
+        self.block_msg: str = 'Shard ID %s heartbeat blocked for more than %s seconds.'
+        self.behind_msg: str = 'Can\'t keep up, shard ID %s websocket is %.1fs behind.'
+        self._stop_ev: threading.Event = threading.Event()
+        self._last_ack: float = time.perf_counter()
+        self._last_send: float = time.perf_counter()
+        self._last_recv: float = time.perf_counter()
+        self.latency: float = float('inf')
+        self.heartbeat_timeout: float = ws._max_heartbeat_timeout
 
     def run(self) -> None:
-        self._end.clear()
-        self._running.set()
-        if self.start_paused:
-            self.pause()
-        try:
-            self._do_run()
-        except Exception:
-            _log.exception('Error in %s', self)
-        finally:
-            self.stop()
-            self._running.clear()
-            self._callbacks.clear()
+        while not self._stop_ev.wait(self.interval):
+            if self._last_recv + self.heartbeat_timeout < time.perf_counter():
+                _log.warning("Shard ID %s has stopped responding to the gateway. Closing and restarting.", self.shard_id)
+                coro = self.ws.close(4000)
+                f = asyncio.run_coroutine_threadsafe(coro, loop=self.ws.loop)
 
-    def _do_run(self) -> None:
-        while not self._end.is_set():
-            if not self._running.is_set():
-                self._running.wait()
-                continue
+                try:
+                    f.result()
+                except Exception:
+                    _log.exception('An error occurred while stopping the gateway. Ignoring.')
+                finally:
+                    self.stop()
+                    return
 
-            # Since this socket is a non blocking socket, select has to be used to wait on it for reading.
+            data = self.get_payload()
+            _log.debug(self.msg, self.shard_id, data['d'])
+            coro = self.ws.send_heartbeat(data)
+            f = asyncio.run_coroutine_threadsafe(coro, loop=self.ws.loop)
             try:
-                readable, _, _ = select.select([self.state.socket], [], [], 30)
-            except (ValueError, TypeError, OSError) as e:
-                _log.debug(
-                    "Select error handling socket in reader, this should be safe to ignore: %s: %s", e.__class__.__name__, e
-                )
-                # The socket is either closed or doesn't exist at the moment
-                continue
-
-            if not readable:
-                continue
-
-            try:
-                data = self.state.socket.recv(2048)
-            except OSError:
-                _log.debug('Error reading from socket in %s, this should be safe to ignore', self, exc_info=True)
-            else:
-                for cb in self._callbacks:
+                # block until sending is complete
+                total = 0
+                while True:
                     try:
-                        cb(data)
-                    except Exception:
-                        _log.exception('Error calling %s in %s', cb, self)
+                        f.result(10)
+                        break
+                    except concurrent.futures.TimeoutError:
+                        total += 10
+                        try:
+                            frame = sys._current_frames()[self._main_thread_id]
+                        except KeyError:
+                            msg = self.block_msg
+                        else:
+                            stack = ''.join(traceback.format_stack(frame))
+                            msg = f'{self.block_msg}\nLoop thread traceback (most recent call last):\n{stack}'
+                        _log.warning(msg, self.shard_id, total)
+
+            except Exception:
+                self.stop()
+            else:
+                self._last_send = time.perf_counter()
+
+    def get_payload(self) -> Dict[str, Any]:
+        return {
+            'op': self.ws.HEARTBEAT,
+            'd': self.ws.sequence,
+        }
+
+    def stop(self) -> None:
+        self._stop_ev.set()
+
+    def tick(self) -> None:
+        self._last_recv = time.perf_counter()
+
+    def ack(self) -> None:
+        ack_time = time.perf_counter()
+        self._last_ack = ack_time
+        self.latency = ack_time - self._last_send
+        if self.latency > 10:
+            _log.warning(self.behind_msg, self.shard_id, self.latency)
 
 
-class ConnectionFlowState(Enum):
-    """Enum representing voice connection flow state."""
+class VoiceKeepAliveHandler(KeepAliveHandler):
+    if TYPE_CHECKING:
+        ws: DiscordVoiceWebSocket
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        name: str = kwargs.pop('name', f'voice-keep-alive-handler:{id(self):#x}')
+        super().__init__(*args, name=name, **kwargs)
+        self.recent_ack_latencies: Deque[float] = deque(maxlen=20)
+        self.msg: str = 'Keeping shard ID %s voice websocket alive with timestamp %s.'
+        self.block_msg: str = 'Shard ID %s voice heartbeat blocked for more than %s seconds'
+        self.behind_msg: str = 'High socket latency, shard ID %s heartbeat is %.1fs behind'
+
+    def get_payload(self) -> Dict[str, Any]:
+        return {
+            'op': self.ws.HEARTBEAT,
+            'd': {
+                't': int(time.time() * 1000),
+                'seq_ack': self.ws.seq_ack,
+            },
+        }
+
+    def ack(self) -> None:
+        ack_time = time.perf_counter()
+        self._last_ack = ack_time
+        self._last_recv = ack_time
+        self.latency: float = ack_time - self._last_send
+        self.recent_ack_latencies.append(self.latency)
+
+
+class DiscordClientWebSocketResponse(aiohttp.ClientWebSocketResponse):
+    async def close(self, *, code: int = 4000, message: bytes = b'') -> bool:
+        return await super().close(code=code, message=message)
+
+
+DWS = TypeVar('DWS', bound='DiscordWebSocket')
+
+
+class DiscordWebSocket:
+    """Implements a WebSocket for Discord's gateway v10.
+
+    Attributes
+    -----------
+    DISPATCH
+        Receive only. Denotes an event to be sent to Discord, such as READY.
+    HEARTBEAT
+        When received tells Discord to keep the connection alive.
+        When sent asks if your connection is currently alive.
+    IDENTIFY
+        Send only. Starts a new session.
+    PRESENCE
+        Send only. Updates your presence.
+    VOICE_STATE
+        Send only. Starts a new connection to a voice guild.
+    VOICE_PING
+        Send only. Checks ping time to a voice guild, do not use.
+    RESUME
+        Send only. Resumes an existing connection.
+    RECONNECT
+        Receive only. Tells the client to reconnect to a new gateway.
+    REQUEST_MEMBERS
+        Send only. Asks for the full member list of a guild.
+    INVALIDATE_SESSION
+        Receive only. Tells the client to optionally invalidate the session
+        and IDENTIFY again.
+    HELLO
+        Receive only. Tells the client the heartbeat interval.
+    HEARTBEAT_ACK
+        Receive only. Confirms receiving of a heartbeat. Not having it implies
+        a connection issue.
+    GUILD_SYNC
+        Send only. Requests a guild sync.
+    gateway
+        The gateway we are currently connected to.
+    token
+        The authentication token for discord.
+    """
+
+    if TYPE_CHECKING:
+        token: Optional[str]
+        _connection: ConnectionState
+        _discord_parsers: Dict[str, Callable[..., Any]]
+        call_hooks: Callable[..., Any]
+        _initial_identify: bool
+        shard_id: Optional[int]
+        shard_count: Optional[int]
+        gateway: yarl.URL
+        _max_heartbeat_timeout: float
 
     # fmt: off
-    disconnected            = 0
-    set_guild_voice_state   = 1
-    got_voice_state_update  = 2
-    got_voice_server_update = 3
-    got_both_voice_updates  = 4
-    websocket_connected     = 5
-    got_websocket_ready     = 6
-    got_ip_discovery        = 7
-    connected               = 8
+    DEFAULT_GATEWAY    = yarl.URL('wss://gateway.discord.gg/')
+    DISPATCH                    = 0
+    HEARTBEAT                   = 1
+    IDENTIFY                    = 2
+    PRESENCE                    = 3
+    VOICE_STATE                 = 4
+    VOICE_PING                  = 5
+    RESUME                      = 6
+    RECONNECT                   = 7
+    REQUEST_MEMBERS             = 8
+    INVALIDATE_SESSION          = 9
+    HELLO                       = 10
+    HEARTBEAT_ACK               = 11
+    GUILD_SYNC                  = 12
     # fmt: on
 
+    def __init__(self, socket: aiohttp.ClientWebSocketResponse, *, loop: asyncio.AbstractEventLoop) -> None:
+        self.socket: aiohttp.ClientWebSocketResponse = socket
+        self.loop: asyncio.AbstractEventLoop = loop
 
-class VoiceConnectionState:
-    """Represents the internal state of a voice connection."""
+        # an empty dispatcher to prevent crashes
+        self._dispatch: Callable[..., Any] = lambda *args: None
+        # generic event listeners
+        self._dispatch_listeners: List[EventListener] = []
+        # the keep alive
+        self._keep_alive: Optional[KeepAliveHandler] = None
+        self.thread_id: int = threading.get_ident()
 
-    def __init__(self, voice_client: VoiceClient, *, hook: Optional[WebsocketHook] = None) -> None:
-        self.voice_client = voice_client
-        self.hook = hook
-
-        self.timeout: float = 30.0
-        self.reconnect: bool = True
-        self.self_deaf: bool = False
-        self.self_mute: bool = False
-        self.token: Optional[str] = None
+        # ws related stuff
         self.session_id: Optional[str] = None
-        self.endpoint: Optional[str] = None
-        self.endpoint_ip: Optional[str] = None
-        self.server_id: Optional[int] = None
-        self.ip: Optional[str] = None
-        self.port: Optional[int] = None
-        self.voice_port: Optional[int] = None
-        self.secret_key: List[int] = MISSING
-        self.ssrc: int = MISSING
-        self.mode: SupportedModes = MISSING
-        self.socket: socket.socket = MISSING
-        self.ws: DiscordVoiceWebSocket = MISSING
-
-        self._state: ConnectionFlowState = ConnectionFlowState.disconnected
-        self._expecting_disconnect: bool = False
-        self._connected = threading.Event()
-        self._state_event = asyncio.Event()
-        self._disconnected = asyncio.Event()
-        self._runner: Optional[asyncio.Task] = None
-        self._connector: Optional[asyncio.Task] = None
-        self._socket_reader = SocketReader(self)
-        self._socket_reader.start()
+        self.sequence: Optional[int] = None
+        self._decompressor: utils._DecompressionContext = utils._ActiveDecompressionContext()
+        self._close_code: Optional[int] = None
+        self._rate_limiter: GatewayRatelimiter = GatewayRatelimiter()
 
     @property
-    def state(self) -> ConnectionFlowState:
-        return self._state
+    def open(self) -> bool:
+        return not self.socket.closed
 
-    @state.setter
-    def state(self, state: ConnectionFlowState) -> None:
-        if state is not self._state:
-            _log.debug('Connection state changed to %s', state.name)
-        self._state = state
-        self._state_event.set()
-        self._state_event.clear()
+    def is_ratelimited(self) -> bool:
+        return self._rate_limiter.is_ratelimited()
 
-        if state is ConnectionFlowState.connected:
-            self._connected.set()
+    def debug_log_receive(self, data: Dict[str, Any], /) -> None:
+        self._dispatch('socket_raw_receive', data)
+
+    def log_receive(self, _: Dict[str, Any], /) -> None:
+        pass
+
+    @classmethod
+    async def from_client(
+        cls,
+        client: Client,
+        *,
+        initial: bool = False,
+        gateway: Optional[yarl.URL] = None,
+        shard_id: Optional[int] = None,
+        session: Optional[str] = None,
+        sequence: Optional[int] = None,
+        resume: bool = False,
+        encoding: str = 'json',
+        compress: bool = True,
+    ) -> Self:
+        """Creates a main websocket for Discord from a :class:`Client`.
+
+        This is for internal use only.
+        """
+        # Circular import
+        from .http import INTERNAL_API_VERSION
+
+        gateway = gateway or cls.DEFAULT_GATEWAY
+
+        if not compress:
+            url = gateway.with_query(v=INTERNAL_API_VERSION, encoding=encoding)
         else:
-            self._connected.clear()
-
-    @property
-    def guild(self) -> Guild:
-        return self.voice_client.guild
-
-    @property
-    def user(self) -> ClientUser:
-        return self.voice_client.user
-
-    @property
-    def supported_modes(self) -> Tuple[SupportedModes, ...]:
-        return self.voice_client.supported_modes
-
-    @property
-    def self_voice_state(self) -> Optional[VoiceState]:
-        return self.guild.me.voice
-
-    async def voice_state_update(self, data: GuildVoiceStatePayload) -> None:
-        channel_id = data['channel_id']
-
-        if channel_id is None:
-            self._disconnected.set()
-
-            # If we know we're going to get a voice_state_update where we have no channel due to
-            # being in the reconnect or disconnect flow, we ignore it.  Otherwise, it probably wasn't from us.
-            if self._expecting_disconnect:
-                self._expecting_disconnect = False
-            else:
-                _log.debug('We were externally disconnected from voice.')
-                await self.disconnect()
-
-            return
-
-        channel_id = int(channel_id)
-        self.session_id = data['session_id']
-
-        # we got the event while connecting
-        if self.state in (ConnectionFlowState.set_guild_voice_state, ConnectionFlowState.got_voice_server_update):
-            if self.state is ConnectionFlowState.set_guild_voice_state:
-                self.state = ConnectionFlowState.got_voice_state_update
-
-                # we moved ourselves
-                if channel_id != self.voice_client.channel.id:
-                    self._update_voice_channel(channel_id)
-
-            else:
-                self.state = ConnectionFlowState.got_both_voice_updates
-            return
-
-        if self.state is ConnectionFlowState.connected:
-            self._update_voice_channel(channel_id)
-
-        elif self.state is not ConnectionFlowState.disconnected:
-            if channel_id != self.voice_client.channel.id:
-                # For some unfortunate reason we were moved during the connection flow
-                _log.info('Handling channel move while connecting...')
-
-                self._update_voice_channel(channel_id)
-                await self.soft_disconnect(with_state=ConnectionFlowState.got_voice_state_update)
-                await self.connect(
-                    reconnect=self.reconnect,
-                    timeout=self.timeout,
-                    self_deaf=(self.self_voice_state or self).self_deaf,
-                    self_mute=(self.self_voice_state or self).self_mute,
-                    resume=False,
-                    wait=False,
-                )
-            else:
-                _log.debug('Ignoring unexpected voice_state_update event')
-
-    async def voice_server_update(self, data: VoiceServerUpdatePayload) -> None:
-        previous_token = self.token
-        previous_server_id = self.server_id
-        previous_endpoint = self.endpoint
-
-        self.token = data['token']
-        self.server_id = int(data['guild_id'])
-        endpoint = data.get('endpoint')
-
-        if self.token is None or endpoint is None:
-            _log.warning(
-                'Awaiting endpoint... This requires waiting. '
-                'If timeout occurred considering raising the timeout and reconnecting.'
+            url = gateway.with_query(
+                v=INTERNAL_API_VERSION, encoding=encoding, compress=utils._ActiveDecompressionContext.COMPRESSION_TYPE
             )
-            return
 
-        self.endpoint = endpoint
-        if self.endpoint.startswith('wss://'):
-            # Just in case, strip it off since we're going to add it later
-            self.endpoint = self.endpoint[6:]
+        socket = await client.http.ws_connect(str(url))
+        ws = cls(socket, loop=client.loop)
 
-        # we got the event while connecting
-        if self.state in (ConnectionFlowState.set_guild_voice_state, ConnectionFlowState.got_voice_state_update):
-            # This gets set after READY is received
-            self.endpoint_ip = MISSING
-            self._create_socket()
+        # dynamically add attributes needed
+        ws.token = client.http.token
+        ws._connection = client._connection
+        ws._discord_parsers = client._connection.parsers
+        ws._dispatch = client.dispatch
+        ws.gateway = gateway
+        ws.call_hooks = client._connection.call_hooks
+        ws._initial_identify = initial
+        ws.shard_id = shard_id
+        ws._rate_limiter.shard_id = shard_id
+        ws.shard_count = client._connection.shard_count
+        ws.session_id = session
+        ws.sequence = sequence
+        ws._max_heartbeat_timeout = client._connection.heartbeat_timeout
 
-            if self.state is ConnectionFlowState.set_guild_voice_state:
-                self.state = ConnectionFlowState.got_voice_server_update
-            else:
-                self.state = ConnectionFlowState.got_both_voice_updates
+        if client._enable_debug_events:
+            ws.send = ws.debug_send
+            ws.log_receive = ws.debug_log_receive
 
-        elif self.state is ConnectionFlowState.connected:
-            _log.debug('Voice server update, closing old voice websocket')
-            await self.ws.close(4014)
-            self.state = ConnectionFlowState.got_voice_server_update
+        client._connection._update_references(ws)
 
-        elif self.state is not ConnectionFlowState.disconnected:
-            # eventual consistency
-            if previous_token == self.token and previous_server_id == self.server_id and previous_endpoint == self.endpoint:
-                return
+        _log.debug('Created websocket connected to %s', gateway)
 
-            _log.debug('Unexpected server update event, attempting to handle')
+        # poll event for OP Hello
+        await ws.poll_event()
 
-            await self.soft_disconnect(with_state=ConnectionFlowState.got_voice_server_update)
-            await self.connect(
-                reconnect=self.reconnect,
-                timeout=self.timeout,
-                self_deaf=(self.self_voice_state or self).self_deaf,
-                self_mute=(self.self_voice_state or self).self_mute,
-                resume=False,
-                wait=False,
-            )
-            self._create_socket()
+        if not resume:
+            await ws.identify()
+            return ws
 
-    async def connect(
-        self, *, reconnect: bool, timeout: float, self_deaf: bool, self_mute: bool, resume: bool, wait: bool = True
-    ) -> None:
-        if self._connector:
-            self._connector.cancel()
-            self._connector = None
-
-        if self._runner:
-            self._runner.cancel()
-            self._runner = None
-
-        self.timeout = timeout
-        self.reconnect = reconnect
-        self._connector = self.voice_client.loop.create_task(
-            self._wrap_connect(reconnect, timeout, self_deaf, self_mute, resume), name='Voice connector'
-        )
-        if wait:
-            await self._connector
-
-    async def _wrap_connect(self, *args: Any) -> None:
-        try:
-            await self._connect(*args)
-        except asyncio.CancelledError:
-            _log.debug('Cancelling voice connection')
-            await self.soft_disconnect()
-            raise
-        except asyncio.TimeoutError:
-            _log.info('Timed out connecting to voice')
-            await self.disconnect()
-            raise
-        except Exception:
-            _log.exception('Error connecting to voice... disconnecting')
-            await self.disconnect()
-            raise
-
-    async def _inner_connect(self, reconnect: bool, self_deaf: bool, self_mute: bool, resume: bool) -> None:
-        for i in range(5):
-            _log.info('Starting voice handshake... (connection attempt %d)', i + 1)
-
-            await self._voice_connect(self_deaf=self_deaf, self_mute=self_mute)
-            # Setting this unnecessarily will break reconnecting
-            if self.state is ConnectionFlowState.disconnected:
-                self.state = ConnectionFlowState.set_guild_voice_state
-
-            await self._wait_for_state(ConnectionFlowState.got_both_voice_updates)
-
-            _log.info('Voice handshake complete. Endpoint found: %s', self.endpoint)
-
-            try:
-                self.ws = await self._connect_websocket(resume)
-                await self._handshake_websocket()
-                break
-            except ConnectionClosed:
-                if reconnect:
-                    wait = 1 + i * 2.0
-                    _log.exception('Failed to connect to voice... Retrying in %ss...', wait)
-                    await self.disconnect(cleanup=False)
-                    await asyncio.sleep(wait)
-                    continue
-                else:
-                    await self.disconnect()
-                    raise
-
-    async def _connect(self, reconnect: bool, timeout: float, self_deaf: bool, self_mute: bool, resume: bool) -> None:
-        _log.info('Connecting to voice...')
-
-        await asyncio.wait_for(
-            self._inner_connect(reconnect=reconnect, self_deaf=self_deaf, self_mute=self_mute, resume=resume),
-            timeout=timeout,
-        )
-        _log.info('Voice connection complete.')
-
-        if not self._runner:
-            self._runner = self.voice_client.loop.create_task(self._poll_voice_ws(reconnect), name='Voice websocket poller')
-
-    async def disconnect(self, *, force: bool = True, cleanup: bool = True, wait: bool = False) -> None:
-        if not force and not self.is_connected():
-            return
-
-        try:
-            await self._voice_disconnect()
-            if self.ws:
-                await self.ws.close()
-        except Exception:
-            _log.debug('Ignoring exception disconnecting from voice', exc_info=True)
-        finally:
-            self.state = ConnectionFlowState.disconnected
-            self._socket_reader.pause()
-
-            # Stop threads before we unlock waiters so they end properly
-            if cleanup:
-                self._socket_reader.stop()
-                self.voice_client.stop()
-
-            # Flip the connected event to unlock any waiters
-            self._connected.set()
-            self._connected.clear()
-
-            if self.socket:
-                self.socket.close()
-
-            self.ip = MISSING
-            self.port = MISSING
-
-            # Skip this part if disconnect was called from the poll loop task
-            if wait and not self._inside_runner():
-                # Wait for the voice_state_update event confirming the bot left the voice channel.
-                # This prevents a race condition caused by disconnecting and immediately connecting again.
-                # The new VoiceConnectionState object receives the voice_state_update event containing channel=None while still
-                # connecting leaving it in a bad state.  Since there's no nice way to transfer state to the new one, we have to do this.
-                try:
-                    await asyncio.wait_for(self._disconnected.wait(), timeout=self.timeout)
-                except TimeoutError:
-                    _log.debug('Timed out waiting for voice disconnection confirmation')
-                except asyncio.CancelledError:
-                    pass
-
-            if cleanup:
-                self.voice_client.cleanup()
-
-    async def soft_disconnect(self, *, with_state: ConnectionFlowState = ConnectionFlowState.got_both_voice_updates) -> None:
-        _log.debug('Soft disconnecting from voice')
-        # Stop the websocket reader because closing the websocket will trigger an unwanted reconnect
-        if self._runner:
-            self._runner.cancel()
-            self._runner = None
-
-        try:
-            if self.ws:
-                await self.ws.close()
-        except Exception:
-            _log.debug('Ignoring exception soft disconnecting from voice', exc_info=True)
-        finally:
-            self.state = with_state
-            self._socket_reader.pause()
-
-            if self.socket:
-                self.socket.close()
-
-            self.ip = MISSING
-            self.port = MISSING
-
-    async def move_to(self, channel: Optional[abc.Snowflake], timeout: Optional[float]) -> None:
-        if channel is None:
-            # This function should only be called externally so its ok to wait for the disconnect.
-            await self.disconnect(wait=True)
-            return
-
-        if self.voice_client.channel and channel.id == self.voice_client.channel.id:
-            return
-
-        previous_state = self.state
-
-        # this is only an outgoing ws request
-        # if it fails, nothing happens and nothing changes (besides self.state)
-        await self._move_to(channel)
-
-        last_state = self.state
-        try:
-            await self.wait_async(timeout)
-        except asyncio.TimeoutError:
-            _log.warning('Timed out trying to move to channel %s in guild %s', channel.id, self.guild.id)
-            if self.state is last_state:
-                _log.debug('Reverting to previous state %s', previous_state.name)
-                self.state = previous_state
-
-    def wait(self, timeout: Optional[float] = None) -> bool:
-        return self._connected.wait(timeout)
-
-    async def wait_async(self, timeout: Optional[float] = None) -> None:
-        await self._wait_for_state(ConnectionFlowState.connected, timeout=timeout)
-
-    def is_connected(self) -> bool:
-        return self.state is ConnectionFlowState.connected
-
-    def send_packet(self, packet: bytes) -> None:
-        self.socket.sendall(packet)
-
-    def add_socket_listener(self, callback: SocketReaderCallback) -> None:
-        _log.debug('Registering socket listener callback %s', callback)
-        self._socket_reader.register(callback)
-
-    def remove_socket_listener(self, callback: SocketReaderCallback) -> None:
-        _log.debug('Unregistering socket listener callback %s', callback)
-        self._socket_reader.unregister(callback)
-
-    def _inside_runner(self) -> bool:
-        return self._runner is not None and asyncio.current_task() == self._runner
-
-    async def _wait_for_state(
-        self, state: ConnectionFlowState, *other_states: ConnectionFlowState, timeout: Optional[float] = None
-    ) -> None:
-        states = (state, *other_states)
-        while True:
-            if self.state in states:
-                return
-            await sane_wait_for([self._state_event.wait()], timeout=timeout)
-
-    async def _voice_connect(self, *, self_deaf: bool = False, self_mute: bool = False) -> None:
-        channel = self.voice_client.channel
-        await channel.guild.change_voice_state(channel=channel, self_deaf=self_deaf, self_mute=self_mute)
-
-    async def _voice_disconnect(self) -> None:
-        _log.info(
-            'The voice handshake is being terminated for Channel ID %s (Guild ID %s)',
-            self.voice_client.channel.id,
-            self.voice_client.guild.id,
-        )
-        self.state = ConnectionFlowState.disconnected
-        await self.voice_client.channel.guild.change_voice_state(channel=None)
-        self._expecting_disconnect = True
-        self._disconnected.clear()
-
-    async def _connect_websocket(self, resume: bool) -> DiscordVoiceWebSocket:
-        seq_ack = -1
-        if self.ws is not MISSING:
-            seq_ack = self.ws.seq_ack
-        ws = await DiscordVoiceWebSocket.from_connection_state(self, resume=resume, hook=self.hook, seq_ack=seq_ack)
-        self.state = ConnectionFlowState.websocket_connected
+        await ws.resume()
         return ws
 
-    async def _handshake_websocket(self) -> None:
-        while not self.ip:
-            await self.ws.poll_event()
-        self.state = ConnectionFlowState.got_ip_discovery
-        while self.ws.secret_key is None:
-            await self.ws.poll_event()
-        self.state = ConnectionFlowState.connected
+    def wait_for(
+        self,
+        event: str,
+        predicate: Callable[[Dict[str, Any]], bool],
+        result: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    ) -> asyncio.Future[Any]:
+        """Waits for a DISPATCH'd event that meets the predicate.
 
-    def _create_socket(self) -> None:
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.setblocking(False)
-        self._socket_reader.resume()
+        Parameters
+        -----------
+        event: :class:`str`
+            The event name in all upper case to wait for.
+        predicate
+            A function that takes a data parameter to check for event
+            properties. The data parameter is the 'd' key in the JSON message.
+        result
+            A function that takes the same data parameter and executes to send
+            the result to the future. If ``None``, returns the data.
 
-    async def _poll_voice_ws(self, reconnect: bool) -> None:
-        backoff = ExponentialBackoff()
-        while True:
-            try:
-                await self.ws.poll_event()
-            except asyncio.CancelledError:
+        Returns
+        --------
+        asyncio.Future
+            A future to wait for.
+        """
+
+        future = self.loop.create_future()
+        entry = EventListener(event=event, predicate=predicate, result=result, future=future)
+        self._dispatch_listeners.append(entry)
+        return future
+
+    async def identify(self) -> None:
+        """Sends the IDENTIFY packet."""
+        payload = {
+            'op': self.IDENTIFY,
+            'd': {
+                'token': self.token,
+                'properties': {
+                    'os': sys.platform,
+                    'browser': 'discord.py',
+                    'device': 'discord.py',
+                },
+                'compress': True,
+                'large_threshold': 250,
+            },
+        }
+
+        if self.shard_id is not None and self.shard_count is not None:
+            payload['d']['shard'] = [self.shard_id, self.shard_count]
+
+        state = self._connection
+        if state._activity is not None or state._status is not None:
+            payload['d']['presence'] = {
+                'status': state._status,
+                'game': state._activity,
+                'since': 0,
+                'afk': False,
+            }
+
+        if state._intents is not None:
+            payload['d']['intents'] = state._intents.value
+
+        await self.call_hooks('before_identify', self.shard_id, initial=self._initial_identify)
+        await self.send_as_json(payload)
+        _log.debug('Shard ID %s has sent the IDENTIFY payload.', self.shard_id)
+
+    async def resume(self) -> None:
+        """Sends the RESUME packet."""
+        payload = {
+            'op': self.RESUME,
+            'd': {
+                'seq': self.sequence,
+                'session_id': self.session_id,
+                'token': self.token,
+            },
+        }
+
+        await self.send_as_json(payload)
+        _log.debug('Shard ID %s has sent the RESUME payload.', self.shard_id)
+
+    async def received_message(self, msg: Any, /) -> None:
+        if type(msg) is bytes:
+            msg = self._decompressor.decompress(msg)
+
+            # Received a partial gateway message
+            if msg is None:
                 return
-            except (ConnectionClosed, asyncio.TimeoutError) as exc:
-                if isinstance(exc, ConnectionClosed):
-                    # The following close codes are undocumented so I will document them here.
-                    # 1000 - normal closure (obviously)
-                    # 4014 - we were externally disconnected (voice channel deleted, we were moved, etc)
-                    # 4015 - voice server has crashed, we should resume
-                    # 4021 - rate limited, we should not reconnect
-                    # 4022 - call terminated, similar to 4014
-                    if exc.code == 1000:
-                        # Don't call disconnect a second time if the websocket closed from a disconnect call
-                        if not self._expecting_disconnect:
-                            _log.info('Disconnecting from voice normally, close code %d.', exc.code)
-                            await self.disconnect()
-                        break
 
-                    if exc.code in (4014, 4022):
-                        # We were disconnected by discord
-                        # This condition is a race between the main ws event and the voice ws closing
-                        if self._disconnected.is_set():
-                            _log.info('Disconnected from voice by discord, close code %d.', exc.code)
-                            await self.disconnect()
-                            break
+        self.log_receive(msg)
+        msg = utils._from_json(msg)
 
-                        # We may have been moved to a different channel
-                        _log.info('Disconnected from voice by force... potentially reconnecting.')
-                        successful = await self._potential_reconnect()
-                        if not successful:
-                            _log.info('Reconnect was unsuccessful, disconnecting from voice normally...')
-                            # Don't bother to disconnect if already disconnected
-                            if self.state is not ConnectionFlowState.disconnected:
-                                await self.disconnect()
-                            break
-                        else:
-                            continue
+        _log.debug('For Shard ID %s: WebSocket Event: %s', self.shard_id, msg)
+        event = msg.get('t')
+        if event:
+            self._dispatch('socket_event_type', event)
 
-                    if exc.code == 4021:
-                        _log.warning('We are being ratelimited while trying to connect to voice. Disconnecting...')
-                        if self.state is not ConnectionFlowState.disconnected:
-                            await self.disconnect()
-                        break
+        op = msg.get('op')
+        data = msg.get('d')
+        seq = msg.get('s')
+        if seq is not None:
+            self.sequence = seq
 
-                    if exc.code == 4015:
-                        _log.info('Disconnected from voice, attempting a resume...')
-                        try:
-                            await self._connect(
-                                reconnect=reconnect,
-                                timeout=self.timeout,
-                                self_deaf=(self.self_voice_state or self).self_deaf,
-                                self_mute=(self.self_voice_state or self).self_mute,
-                                resume=True,
-                            )
-                        except asyncio.TimeoutError:
-                            _log.info('Could not resume the voice connection... Disconnecting...')
-                            if self.state is not ConnectionFlowState.disconnected:
-                                await self.disconnect()
-                            break
-                        else:
-                            _log.info('Successfully resumed voice connection')
-                            continue
+        if self._keep_alive:
+            self._keep_alive.tick()
 
-                    _log.debug('Not handling close code %s (%s)', exc.code, exc.reason or 'no reason')
+        if op != self.DISPATCH:
+            if op == self.RECONNECT:
+                # "reconnect" can only be handled by the Client
+                # so we terminate our connection and raise an
+                # internal exception signalling to reconnect.
+                _log.debug('Received RECONNECT opcode.')
+                await self.close()
+                raise ReconnectWebSocket(self.shard_id)
 
-                if not reconnect:
-                    await self.disconnect()
-                    raise
+            if op == self.HEARTBEAT_ACK:
+                if self._keep_alive:
+                    self._keep_alive.ack()
+                return
 
-                retry = backoff.delay()
-                _log.exception('Disconnected from voice... Reconnecting in %.2fs.', retry)
-                await asyncio.sleep(retry)
-                await self.disconnect(cleanup=False)
+            if op == self.HEARTBEAT:
+                if self._keep_alive:
+                    beat = self._keep_alive.get_payload()
+                    await self.send_as_json(beat)
+                return
 
-                try:
-                    await self._connect(
-                        reconnect=reconnect,
-                        timeout=self.timeout,
-                        self_deaf=(self.self_voice_state or self).self_deaf,
-                        self_mute=(self.self_voice_state or self).self_mute,
-                        resume=False,
-                    )
-                except asyncio.TimeoutError:
-                    # at this point we've retried 5 times... let's continue the loop.
-                    _log.warning('Could not connect to voice... Retrying...')
-                    continue
+            if op == self.HELLO:
+                interval = data['heartbeat_interval'] / 1000.0
+                self._keep_alive = KeepAliveHandler(ws=self, interval=interval, shard_id=self.shard_id)
+                # send a heartbeat immediately
+                await self.send_as_json(self._keep_alive.get_payload())
+                self._keep_alive.start()
+                return
 
-    async def _potential_reconnect(self) -> bool:
+            if op == self.INVALIDATE_SESSION:
+                if data is True:
+                    await self.close()
+                    raise ReconnectWebSocket(self.shard_id)
+
+                self.sequence = None
+                self.session_id = None
+                self.gateway = self.DEFAULT_GATEWAY
+                _log.info('Shard ID %s session has been invalidated.', self.shard_id)
+                await self.close(code=1000)
+                raise ReconnectWebSocket(self.shard_id, resume=False)
+
+            _log.warning('Unknown OP code %s.', op)
+            return
+
+        if event == 'READY':
+            self.sequence = msg['s']
+            self.session_id = data['session_id']
+            self.gateway = yarl.URL(data['resume_gateway_url'])
+            _log.info('Shard ID %s has connected to Gateway (Session ID: %s).', self.shard_id, self.session_id)
+
+        elif event == 'RESUMED':
+            # pass back the shard ID to the resumed handler
+            data['__shard_id__'] = self.shard_id
+            _log.info('Shard ID %s has successfully RESUMED session %s.', self.shard_id, self.session_id)
+
         try:
-            await self._wait_for_state(
-                ConnectionFlowState.got_voice_server_update,
-                ConnectionFlowState.got_both_voice_updates,
-                ConnectionFlowState.disconnected,
-                timeout=self.timeout,
-            )
-        except asyncio.TimeoutError:
-            return False
+            func = self._discord_parsers[event]
+        except KeyError:
+            _log.debug('Unknown event %s.', event)
         else:
-            if self.state is ConnectionFlowState.disconnected:
-                return False
+            func(data)
 
-        previous_ws = self.ws
+        # remove the dispatched listeners
+        removed = []
+        for index, entry in enumerate(self._dispatch_listeners):
+            if entry.event != event:
+                continue
+
+            future = entry.future
+            if future.cancelled():
+                removed.append(index)
+                continue
+
+            try:
+                valid = entry.predicate(data)
+            except Exception as exc:
+                future.set_exception(exc)
+                removed.append(index)
+            else:
+                if valid:
+                    ret = data if entry.result is None else entry.result(data)
+                    future.set_result(ret)
+                    removed.append(index)
+
+        for index in reversed(removed):
+            del self._dispatch_listeners[index]
+
+    @property
+    def latency(self) -> float:
+        """:class:`float`: Measures latency between a HEARTBEAT and a HEARTBEAT_ACK in seconds."""
+        heartbeat = self._keep_alive
+        return float('inf') if heartbeat is None else heartbeat.latency
+
+    def _can_handle_close(self) -> bool:
+        code = self._close_code or self.socket.close_code
+        # If the socket is closed remotely with 1000 and it's not our own explicit close
+        # then it's an improper close that should be handled and reconnected
+        is_improper_close = self._close_code is None and self.socket.close_code == 1000
+        return is_improper_close or code not in (1000, 4004, 4010, 4011, 4012, 4013, 4014)
+
+    async def poll_event(self) -> None:
+        """Polls for a DISPATCH event and handles the general gateway loop.
+
+        Raises
+        ------
+        ConnectionClosed
+            The websocket connection was terminated for unhandled reasons.
+        """
         try:
-            self.ws = await self._connect_websocket(False)
-            await self._handshake_websocket()
-        except (ConnectionClosed, asyncio.TimeoutError):
-            return False
+            msg = await self.socket.receive(timeout=self._max_heartbeat_timeout)
+            if msg.type is aiohttp.WSMsgType.TEXT:
+                await self.received_message(msg.data)
+            elif msg.type is aiohttp.WSMsgType.BINARY:
+                await self.received_message(msg.data)
+            elif msg.type is aiohttp.WSMsgType.ERROR:
+                _log.debug('Received error %s', msg)
+                raise WebSocketClosure
+            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSE):
+                _log.debug('Received %s', msg)
+                raise WebSocketClosure
+        except (asyncio.TimeoutError, WebSocketClosure) as e:
+            # Ensure the keep alive handler is closed
+            if self._keep_alive:
+                self._keep_alive.stop()
+                self._keep_alive = None
+
+            if isinstance(e, asyncio.TimeoutError):
+                _log.debug('Timed out receiving packet. Attempting a reconnect.')
+                raise ReconnectWebSocket(self.shard_id) from None
+
+            code = self._close_code or self.socket.close_code
+            if self._can_handle_close():
+                _log.debug('Websocket closed with %s, attempting a reconnect.', code)
+                raise ReconnectWebSocket(self.shard_id) from None
+            else:
+                _log.debug('Websocket closed with %s, cannot reconnect.', code)
+                raise ConnectionClosed(self.socket, shard_id=self.shard_id, code=code) from None
+
+    async def debug_send(self, data: str, /) -> None:
+        await self._rate_limiter.block()
+        self._dispatch('socket_raw_send', data)
+        await self.socket.send_str(data)
+
+    async def send(self, data: str, /) -> None:
+        await self._rate_limiter.block()
+        await self.socket.send_str(data)
+
+    async def send_as_json(self, data: Any) -> None:
+        try:
+            await self.send(utils._to_json(data))
+        except RuntimeError as exc:
+            if not self._can_handle_close():
+                raise ConnectionClosed(self.socket, shard_id=self.shard_id) from exc
+
+    async def send_heartbeat(self, data: Any) -> None:
+        # This bypasses the rate limit handling code since it has a higher priority
+        try:
+            await self.socket.send_str(utils._to_json(data))
+        except RuntimeError as exc:
+            if not self._can_handle_close():
+                raise ConnectionClosed(self.socket, shard_id=self.shard_id) from exc
+
+    async def change_presence(
+        self,
+        *,
+        activity: Optional[BaseActivity] = None,
+        status: Optional[str] = None,
+        since: float = 0.0,
+    ) -> None:
+        if activity is not None:
+            if not isinstance(activity, BaseActivity):
+                raise TypeError('activity must derive from BaseActivity.')
+            activities = [activity.to_dict()]
         else:
-            return True
-        finally:
-            await previous_ws.close()
+            activities = []
 
-    async def _move_to(self, channel: abc.Snowflake) -> None:
-        await self.voice_client.channel.guild.change_voice_state(channel=channel)
-        self.state = ConnectionFlowState.set_guild_voice_state
+        if status == 'idle':
+            since = int(time.time() * 1000)
 
-    def _update_voice_channel(self, channel_id: Optional[int]) -> None:
-        self.voice_client.channel = channel_id and self.guild.get_channel(channel_id)  # type: ignore
+        payload = {
+            'op': self.PRESENCE,
+            'd': {
+                'activities': activities,
+                'afk': False,
+                'since': since,
+                'status': status,
+            },
+        }
+
+        sent = utils._to_json(payload)
+        _log.debug('Sending "%s" to change status', sent)
+        await self.send(sent)
+
+    async def request_chunks(
+        self,
+        guild_id: int,
+        query: Optional[str] = None,
+        *,
+        limit: int,
+        user_ids: Optional[List[int]] = None,
+        presences: bool = False,
+        nonce: Optional[str] = None,
+    ) -> None:
+        payload = {
+            'op': self.REQUEST_MEMBERS,
+            'd': {
+                'guild_id': guild_id,
+                'presences': presences,
+                'limit': limit,
+            },
+        }
+
+        if nonce:
+            payload['d']['nonce'] = nonce
+
+        if user_ids:
+            payload['d']['user_ids'] = user_ids
+
+        if query is not None:
+            payload['d']['query'] = query
+
+        await self.send_as_json(payload)
+
+    async def voice_state(
+        self,
+        guild_id: int,
+        channel_id: Optional[int],
+        self_mute: bool = False,
+        self_deaf: bool = False,
+    ) -> None:
+        payload = {
+            'op': self.VOICE_STATE,
+            'd': {
+                'guild_id': guild_id,
+                'channel_id': channel_id,
+                'self_mute': self_mute,
+                'self_deaf': self_deaf,
+            },
+        }
+
+        _log.debug('Updating our voice state to %s.', payload)
+        await self.send_as_json(payload)
+
+    async def close(self, code: int = 4000) -> None:
+        if self._keep_alive:
+            self._keep_alive.stop()
+            self._keep_alive = None
+
+        self._close_code = code
+        await self.socket.close(code=code)
+
+
+DVWS = TypeVar('DVWS', bound='DiscordVoiceWebSocket')
+
+
+class DiscordVoiceWebSocket:
+    """Implements the websocket protocol for handling voice connections.
+
+    Attributes
+    -----------
+    IDENTIFY
+        Send only. Starts a new voice session.
+    SELECT_PROTOCOL
+        Send only. Tells discord what encryption mode and how to connect for voice.
+    READY
+        Receive only. Tells the websocket that the initial connection has completed.
+    HEARTBEAT
+        Send only. Keeps your websocket connection alive.
+    SESSION_DESCRIPTION
+        Receive only. Gives you the secret key required for voice.
+    SPEAKING
+        Send only. Notifies the client if you are currently speaking.
+    HEARTBEAT_ACK
+        Receive only. Tells you your heartbeat has been acknowledged.
+    RESUME
+        Sent only. Tells the client to resume its session.
+    HELLO
+        Receive only. Tells you that your websocket connection was acknowledged.
+    RESUMED
+        Sent only. Tells you that your RESUME request has succeeded.
+    CLIENT_CONNECT
+        Indicates a user has connected to voice.
+    CLIENT_DISCONNECT
+        Receive only.  Indicates a user has disconnected from voice.
+    """
+
+    if TYPE_CHECKING:
+        thread_id: int
+        _connection: VoiceConnectionState
+        gateway: str
+        _max_heartbeat_timeout: float
+
+    # fmt: off
+    IDENTIFY            = 0
+    SELECT_PROTOCOL     = 1
+    READY               = 2
+    HEARTBEAT           = 3
+    SESSION_DESCRIPTION = 4
+    SPEAKING            = 5
+    HEARTBEAT_ACK       = 6
+    RESUME              = 7
+    HELLO               = 8
+    RESUMED             = 9
+    CLIENT_CONNECT      = 12
+    CLIENT_DISCONNECT   = 13
+    # fmt: on
+
+    def __init__(
+        self,
+        socket: aiohttp.ClientWebSocketResponse,
+        loop: asyncio.AbstractEventLoop,
+        *,
+        hook: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None,
+    ) -> None:
+        self.ws: aiohttp.ClientWebSocketResponse = socket
+        self.loop: asyncio.AbstractEventLoop = loop
+        self._keep_alive: Optional[VoiceKeepAliveHandler] = None
+        self._close_code: Optional[int] = None
+        self.secret_key: Optional[List[int]] = None
+        # defaulting to -1
+        self.seq_ack: int = -1
+        if hook:
+            self._hook = hook  # type: ignore
+
+    async def _hook(self, *args: Any) -> None:
+        pass
+
+    async def send_as_json(self, data: Any) -> None:
+        _log.debug('Sending voice websocket frame: %s.', data)
+        await self.ws.send_str(utils._to_json(data))
+
+    send_heartbeat = send_as_json
+
+    async def resume(self) -> None:
+        state = self._connection
+        payload = {
+            'op': self.RESUME,
+            'd': {
+                'token': state.token,
+                'server_id': str(state.server_id),
+                'session_id': state.session_id,
+                'seq_ack': self.seq_ack,
+            },
+        }
+        await self.send_as_json(payload)
+
+    async def identify(self) -> None:
+        state = self._connection
+        payload = {
+            'op': self.IDENTIFY,
+            'd': {
+                'server_id': str(state.server_id),
+                'user_id': str(state.user.id),
+                'session_id': state.session_id,
+                'token': state.token,
+            },
+        }
+        await self.send_as_json(payload)
+
+    @classmethod
+    async def from_connection_state(
+        cls,
+        state: VoiceConnectionState,
+        *,
+        resume: bool = False,
+        hook: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None,
+    ) -> Self:
+        """Creates a voice websocket for the :class:`VoiceClient`."""
+        gateway = f'wss://{state.endpoint}/?v=8'
+        client = state.voice_client
+        http = client._state.http
+        socket = await http.ws_connect(gateway, compress=15)
+        ws = cls(socket, loop=client.loop, hook=hook)
+        ws.gateway = gateway
+        ws._connection = state
+        ws._max_heartbeat_timeout = 60.0
+        ws.thread_id = threading.get_ident()
+
+        if resume:
+            await ws.resume()
+        else:
+            await ws.identify()
+
+        return ws
+
+    async def select_protocol(self, ip: str, port: int, mode: str) -> None:
+        payload = {
+            'op': self.SELECT_PROTOCOL,
+            'd': {
+                'protocol': 'udp',
+                'data': {
+                    'address': ip,
+                    'port': port,
+                    'mode': mode,
+                },
+            },
+        }
+
+        await self.send_as_json(payload)
+
+    async def client_connect(self) -> None:
+        payload = {
+            'op': self.CLIENT_CONNECT,
+            'd': {
+                'audio_ssrc': self._connection.ssrc,
+            },
+        }
+
+        await self.send_as_json(payload)
+
+    async def speak(self, state: SpeakingState = SpeakingState.voice) -> None:
+        payload = {
+            'op': self.SPEAKING,
+            'd': {
+                'speaking': int(state),
+                'delay': 0,
+                'ssrc': self._connection.ssrc,
+            },
+        }
+
+        await self.send_as_json(payload)
+
+    async def received_message(self, msg: Dict[str, Any]) -> None:
+        _log.debug('Voice websocket frame received: %s', msg)
+        op = msg['op']
+        data = msg['d']  # According to Discord this key is always given
+        self.seq_ack = msg.get('seq', self.seq_ack)  # this key may not be given
+
+        if op == self.READY:
+            await self.initial_connection(data)
+        elif op == self.HEARTBEAT_ACK:
+            if self._keep_alive:
+                self._keep_alive.ack()
+        elif op == self.RESUMED:
+            _log.debug('Voice RESUME succeeded.')
+        elif op == self.SESSION_DESCRIPTION:
+            self._connection.mode = data['mode']
+            await self.load_secret_key(data)
+        elif op == self.HELLO:
+            interval = data['heartbeat_interval'] / 1000.0
+            self._keep_alive = VoiceKeepAliveHandler(ws=self, interval=min(interval, 5.0))
+            self._keep_alive.start()
+
+        await self._hook(self, msg)
+
+    async def initial_connection(self, data: Dict[str, Any]) -> None:
+        state = self._connection
+        state.ssrc = data['ssrc']
+        state.voice_port = data['port']
+        state.endpoint_ip = data['ip']
+
+        _log.debug('Connecting to voice socket')
+        await self.loop.sock_connect(state.socket, (state.endpoint_ip, state.voice_port))
+
+        state.ip, state.port = await self.discover_ip()
+        # there *should* always be at least one supported mode (xsalsa20_poly1305)
+        modes = [mode for mode in data['modes'] if mode in self._connection.supported_modes]
+        _log.debug('received supported encryption modes: %s', ', '.join(modes))
+
+        mode = modes[0]
+        await self.select_protocol(state.ip, state.port, mode)
+        _log.debug('selected the voice protocol for use (%s)', mode)
+
+    async def discover_ip(self) -> Tuple[str, int]:
+        state = self._connection
+        packet = bytearray(74)
+        struct.pack_into('>H', packet, 0, 1)  # 1 = Send
+        struct.pack_into('>H', packet, 2, 70)  # 70 = Length
+        struct.pack_into('>I', packet, 4, state.ssrc)
+
+        _log.debug('Sending ip discovery packet')
+        await self.loop.sock_sendall(state.socket, packet)
+
+        fut: asyncio.Future[bytes] = self.loop.create_future()
+
+        def get_ip_packet(data: bytes):
+            if data[1] == 0x02 and len(data) == 74:
+                self.loop.call_soon_threadsafe(fut.set_result, data)
+
+        fut.add_done_callback(lambda f: state.remove_socket_listener(get_ip_packet))
+        state.add_socket_listener(get_ip_packet)
+        recv = await fut
+
+        _log.debug('Received ip discovery packet: %s', recv)
+
+        # the ip is ascii starting at the 8th byte and ending at the first null
+        ip_start = 8
+        ip_end = recv.index(0, ip_start)
+        ip = recv[ip_start:ip_end].decode('ascii')
+
+        port = struct.unpack_from('>H', recv, len(recv) - 2)[0]
+        _log.debug('detected ip: %s port: %s', ip, port)
+
+        return ip, port
+
+    @property
+    def latency(self) -> float:
+        """:class:`float`: Latency between a HEARTBEAT and its HEARTBEAT_ACK in seconds."""
+        heartbeat = self._keep_alive
+        return float('inf') if heartbeat is None else heartbeat.latency
+
+    @property
+    def average_latency(self) -> float:
+        """:class:`float`: Average of last 20 HEARTBEAT latencies."""
+        heartbeat = self._keep_alive
+        if heartbeat is None or not heartbeat.recent_ack_latencies:
+            return float('inf')
+
+        return sum(heartbeat.recent_ack_latencies) / len(heartbeat.recent_ack_latencies)
+
+    async def load_secret_key(self, data: Dict[str, Any]) -> None:
+        _log.debug('received secret key for voice connection')
+        self.secret_key = self._connection.secret_key = data['secret_key']
+
+        # Send a speak command with the "not speaking" state.
+        # This also tells Discord our SSRC value, which Discord requires before
+        # sending any voice data (and is the real reason why we call this here).
+        await self.speak(SpeakingState.none)
+
+    async def poll_event(self) -> None:
+        # This exception is handled up the chain
+        msg = await asyncio.wait_for(self.ws.receive(), timeout=30.0)
+        if msg.type is aiohttp.WSMsgType.TEXT:
+            await self.received_message(utils._from_json(msg.data))
+        elif msg.type is aiohttp.WSMsgType.ERROR:
+            _log.debug('Received voice %s', msg)
+            raise ConnectionClosed(self.ws, shard_id=None) from msg.data
+        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING):
+            _log.debug('Received voice %s', msg)
+            raise ConnectionClosed(self.ws, shard_id=None, code=self._close_code)
+
+    async def close(self, code: int = 1000) -> None:
+        if self._keep_alive is not None:
+            self._keep_alive.stop()
+
+        self._close_code = code
+        await self.ws.close(code=code)
